@@ -1,0 +1,316 @@
+from PIL import Image
+import numpy as np
+import cv2
+
+# --- Helper function (Internal to center_and_resize) ---
+def _find_content_bounding_box(pil_img, background_color=(255, 255, 255), tolerance=5):
+    """
+    Finds the bounding box of non-background content in a PIL Image object.
+    Internal helper, not meant for direct external calls.
+
+    Args:
+        pil_img (PIL.Image.Image): The input PIL Image object.
+        background_color (tuple): The RGB tuple of the background color.
+        tolerance (int): A small integer tolerance for background color matching.
+
+    Returns:
+        tuple: (left, upper, right, lower) coordinates of the bounding box,
+               or None if no content is found.
+    """
+    img_rgb = pil_img.convert("RGB")
+    data = np.array(img_rgb)
+
+    non_background_mask = np.any(np.abs(data - np.array(background_color)) > tolerance, axis=-1)
+    rows, cols = np.where(non_background_mask)
+
+    if rows.size == 0 or cols.size == 0:
+        return None  # No content found
+
+    min_row, max_row = np.min(rows), np.max(rows)
+    min_col, max_col = np.min(cols), np.max(cols)
+
+    return (min_col, min_row, max_col + 1, max_row + 1)
+
+# --- Stage 1: Center and Resize ---
+def extract_and_resize_object_contour(image_path, target_size=(64, 64), background_color=(0, 0, 0), threshold=128, min_contour_area=50):
+    """
+    Finds the main object contour in an image, crops to its bounding box,
+    and then resizes the cropped region to the target size, placing it centrally
+    on a new canvas with the specified background color.
+
+    It assumes the object is significantly brighter than the background for contour detection.
+
+    Args:
+        image_path (str): Path to the input image file.
+        target_size (tuple): Desired output size (width, height) for the final image.
+                             Defaults to (64, 64).
+        background_color (tuple): RGB color (0-255) for the new canvas background.
+                                  Defaults to black (0,0,0) as per your images.
+        threshold (int): Grayscale threshold for binarization (0-255). Pixels >= threshold
+                         are considered white (object), others black (background).
+                         Defaults to 128.
+        min_contour_area (int): Minimum area for a contour to be considered a valid object.
+                                Helps filter out small noise. Defaults to 50.
+
+    Returns:
+        PIL.Image.Image: The PIL Image object containing the resized object,
+                         or None if no significant object is found or processing fails.
+    """
+    try:
+        # 1. Load image using PIL
+        with Image.open(image_path) as pil_img:
+            # Convert to grayscale for contour detection
+            img_gray_pil = pil_img.convert("L")
+            img_gray_np = np.array(img_gray_pil)
+
+            # 2. Apply thresholding to get a binary image for contour detection
+            # cv2.threshold expects 0 for black and 255 for white.
+            # THRESH_BINARY: pixel_val > threshold ? 255 : 0
+            _, img_binary = cv2.threshold(img_gray_np, threshold, 255, cv2.THRESH_BINARY)
+
+            # 3. Find contours
+            # cv2.findContours can modify the input array, so we pass a copy
+            # RETR_EXTERNAL retrieves only the outermost contours
+            # CHAIN_APPROX_SIMPLE compresses horizontal, vertical, and diagonal segments
+            contours, _ = cv2.findContours(img_binary.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
+                print(f"Warning: No contours found in {image_path}. Returning a blank image of target size.")
+                return Image.new("RGB", target_size, color=background_color)
+
+            # 4. Identify the main object contour (e.g., the largest one that's not too small)
+            valid_contours = [c for c in contours if cv2.contourArea(c) > min_contour_area]
+
+            if not valid_contours:
+                print(f"Warning: No sufficiently large contours found in {image_path}. Returning a blank image of target size.")
+                return Image.new("RGB", target_size, color=background_color)
+
+            # Get the largest valid contour
+            main_contour = max(valid_contours, key=cv2.contourArea)
+
+            # 5. Get the bounding box (x, y, width, height) of the main contour
+            x, y, w, h = cv2.boundingRect(main_contour)
+
+            # Add a small padding to the bounding box if desired
+            padding = 5 # You can adjust this value
+            x_padded = max(0, x - padding)
+            y_padded = max(0, y - padding)
+            # Ensure padding doesn't go beyond image boundaries
+            w_padded = min(pil_img.width - x_padded, w + 2 * padding)
+            h_padded = min(pil_img.height - y_padded, h + 2 * padding)
+
+            # 6. Crop the *original* PIL image to this (padded) bounding box
+            # Use original image to preserve any initial color/detail before final binarization
+            cropped_object_pil = pil_img.crop((x_padded, y_padded, x_padded + w_padded, y_padded + h_padded))
+
+            # 7. Create a new canvas of the target size with the desired background color
+            final_canvas = Image.new("RGB", target_size, color=background_color)
+
+            # 8. Calculate new dimensions for the cropped object to fit target_size
+            # while maintaining aspect ratio
+            object_aspect_ratio = cropped_object_pil.width / cropped_object_pil.height
+            target_aspect_ratio = target_size[0] / target_size[1]
+
+            if object_aspect_ratio > target_aspect_ratio:
+                # Object is wider than target; scale based on target width
+                new_width = target_size[0]
+                new_height = int(new_width / object_aspect_ratio)
+            else:
+                # Object is taller or same aspect ratio as target; scale based on target height
+                new_height = target_size[1]
+                new_width = int(new_height * object_aspect_ratio)
+
+            # Resize the cropped object to the calculated dimensions
+            # Use Image.Resampling.LANCZOS for high-quality downsampling/upsampling
+            scaled_object = cropped_object_pil.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            # 9. Paste the scaled object onto the center of the new canvas
+            paste_x = (target_size[0] - new_width) // 2
+            paste_y = (target_size[1] - new_height) // 2
+            final_canvas.paste(scaled_object, (paste_x, paste_y))
+
+            return final_canvas
+
+    except FileNotFoundError:
+        print(f"Error: Image file not found at {image_path}")
+        return None
+    except Exception as e:
+        print(f"An error occurred during processing {image_path}: {e}")
+        return None
+
+def center_and_resize(image_path, target_size=(64, 64), background_color=(0,0,0)):
+    """
+    Loads an image from a path, finds its content, centers the content,
+    scales it to fit, and resizes the overall canvas to the target_size.
+
+    Args:
+        image_path (str): Path to the input image file.
+        target_size (tuple): The desired output size (width, height). Defaults to 64x64.
+        background_color (tuple): The RGB color to use for the new background.
+                                  Defaults to white.
+
+    Returns:
+        PIL.Image.Image: The processed PIL Image object, or None if processing fails.
+    """
+    try:
+        with Image.open(image_path) as original_img:
+            # Find bounding box of content
+            bbox = _find_content_bounding_box(original_img, background_color=background_color)
+
+            if bbox is None:
+                print(f"Warning: No significant content found in {image_path}. Returning a blank image of target size.")
+                return Image.new("RGB", target_size, color=background_color)
+
+            # Crop the image to the content's bounding box
+            cropped_content = original_img.crop(bbox)
+
+            # Calculate scaling factor to fit content within target_size
+            content_width, content_height = cropped_content.size
+            target_width, target_height = target_size
+
+            # Determine the scale factor to fit the content within the target_size
+            # This ensures the content is not distorted and fits.
+            scale_factor_w = target_width / content_width
+            scale_factor_h = target_height / content_height
+            scale_factor = min(scale_factor_w, scale_factor_h)
+
+            # Scale down the content if it's larger than the target area
+            # Or scale up if you want to fill the target area and content is smaller.
+            # Here, we scale to fit *within* the target_size, maintaining aspect ratio.
+            new_content_width = int(content_width * scale_factor)
+            new_content_height = int(content_height * scale_factor)
+            scaled_content = cropped_content.resize((new_content_width, new_content_height), Image.LANCZOS)
+
+            # Create a new, empty image of the target size with background color
+            final_img = Image.new("RGB", target_size, color=background_color)
+
+            # Calculate paste position for centering the scaled content
+            paste_x_scaled = (target_width - scaled_content.width) // 2
+            paste_y_scaled = (target_height - scaled_content.height) // 2
+
+            # Paste the scaled content onto the new canvas
+            final_img.paste(scaled_content, (paste_x_scaled, paste_y_scaled))
+
+            return final_img
+
+    except FileNotFoundError:
+        print(f"Error: Image file not found at {image_path}")
+        return None
+    except Exception as e:
+        print(f"An error occurred in center_and_resize: {e}")
+        return None
+
+# --- Stage 2: Convert to Black and White Binary Array ---
+def black_white_array(pil_img_obj, white_is_one=True, threshold=128):
+    """
+    Converts a PIL Image object (expected to be an RGB image from center_and_resize)
+    into a 2D binary NumPy array (0s and 1s).
+
+    Args:
+        pil_img_obj (PIL.Image.Image): The input PIL Image object.
+        white_is_one (bool): If True, white pixels map to 1 and black to 0.
+                             If False, black pixels map to 1 and white to 0.
+                             Defaults to True.
+        threshold (int): For grayscale conversion, pixels with intensity >= threshold
+                         are considered "white", otherwise "black". Defaults to 128.
+
+    Returns:
+        numpy.ndarray: A 2D NumPy array with 0s and 1s representing the
+                       binary image. Returns None if processing fails.
+    """
+    if not isinstance(pil_img_obj, Image.Image):
+        print("Error: Input to black_white_array must be a PIL Image object.")
+        return None
+    try:
+        # Convert to grayscale ('L' mode) first
+        img_grayscale = pil_img_obj.convert("L")
+
+        # Convert to a NumPy array to apply custom thresholding if needed
+        np_img = np.array(img_grayscale)
+
+        # Apply threshold to explicitly make it binary (0 or 255)
+        np_binary_255_0 = (np_img >= threshold) * 255 # Pixels above threshold become 255, else 0
+
+        # Convert to desired 0/1 mapping
+        if white_is_one:
+            # White (255) becomes 1, Black (0) becomes 0
+            final_binary_array = (np_binary_255_0 / 255).astype(int)
+        else:
+            # White (255) becomes 0, Black (0) becomes 1
+            final_binary_array = (np_binary_255_0 == 0).astype(int)
+
+        return final_binary_array
+
+    except Exception as e:
+        print(f"An error occurred in black_white_array: {e}")
+        return None
+
+def compare(img1_binary_array): # Renamed to img1_binary_array for clarity
+    # It's better to pass d as an argument to compare, or define it outside
+    # If you define it inside, it will reload/process all reference images every time compare is called.
+    # For now, I'll keep it inside as you have it, but be aware of performance.
+    d = {
+        "1" : black_white_array(extract_and_resize_object_contour(#path of image consisting one, background_color=(0,0,0))),
+        "2" : black_white_array(extract_and_resize_object_contour(#path of image consisting two, background_color=(0,0,0))),
+        "3" : black_white_array(extract_and_resize_object_contour(#path of image consisting three, background_color=(0,0,0))),
+        "4" : black_white_array(extract_and_resize_object_contour(#path of image consisting four, background_color=(0,0,0))),
+        "5" : black_white_array(extract_and_resize_object_contour(#path of image consisting five, background_color=(0,0,0))),
+        "6" : black_white_array(extract_and_resize_object_contour(#path of image consisting six, background_color=(0,0,0))),
+        "7" : black_white_array(extract_and_resize_object_contour(#path of image consisting seven, background_color=(0,0,0))),
+        "8" : black_white_array(extract_and_resize_object_contour(#path of image consisting eight, background_color=(0,0,0))),
+        "9" : black_white_array(extract_and_resize_object_contour(#path of image consisting nine, background_color=(0,0,0)))
+    }
+
+    # Initialize variables to track the best match
+    best_match_key = None
+    max_matching_pixels = -1 # Initialize with a value lower than any possible match count
+
+    # Ensure the input image is valid before comparing
+    if img1_binary_array is None:
+        print("Error: Input image for comparison is None.")
+        return None
+
+    target_height, target_width = img1_binary_array.shape
+
+    for k, img2_binary_array in d.items():
+        # Check if reference image processing was successful
+        if img2_binary_array is None:
+            print(f"Warning: Reference image for key '{k}' could not be processed. Skipping.")
+            continue
+
+        # Ensure both images have the same dimensions for comparison
+        if img2_binary_array.shape != (target_height, target_width):
+            print(f"Warning: Reference image '{k}' has shape {img2_binary_array.shape}, "
+                  f"expected {img1_binary_array.shape}. Skipping comparison for this image.")
+            continue
+
+        # Calculate matching pixels using NumPy's efficient comparison
+        # (img1_binary_array == img2_binary_array) creates a boolean array
+        # np.sum() counts the True values (where pixels match)
+        current_matching_pixels = np.sum(img1_binary_array == img2_binary_array)
+
+        # Update if this reference image has more matching pixels
+        if current_matching_pixels > max_matching_pixels:
+            max_matching_pixels = current_matching_pixels
+            best_match_key = k
+
+    if best_match_key is None:
+        print("No valid comparisons were made. Check if reference images were loaded correctly.")
+        # Optionally, you might want to return a default or raise an error if no match is found.
+        return None
+
+    return best_match_key
+
+def main():
+  try:
+    img = #path of new image to be identified
+  except FileNotFoundError:
+    print("Image not found")
+    return
+  image = extract_and_resize_object_contour(img)
+  img1 = black_white_array(image)
+  s = compare(img1)
+  print(s)
+
+if __name__ == "__main__":
+  main()
