@@ -9,8 +9,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-# 📁 Replace this with your actual path if different
-base_path = "C:\\Users\\pahal\\archive"
+base_path = #replace this with the archive folder's path
 
 # Load IDX files
 X_train = idx2numpy.convert_from_file(base_path + "\\train-images-idx3-ubyte\\train-images-idx3-ubyte")
@@ -22,7 +21,7 @@ y_test = idx2numpy.convert_from_file(base_path + "\\t10k-labels-idx1-ubyte\\t10k
 X_train = X_train.reshape(-1, 28, 28, 1).astype("float32") / 255.0
 X_test = X_test.reshape(-1, 28, 28, 1).astype("float32") / 255.0
 
-# 🧠 CNN Model
+#accuracy can be changed by addition/deletion of layers
 model = Sequential([
     Conv2D(32, (3,3), activation='relu', input_shape=(28,28,1)),
     BatchNormalization(),
@@ -53,12 +52,11 @@ callbacks = [
     ReduceLROnPlateau(patience=2, factor=0.5)
 ]
 
-# ⏱️ Training
+# To check total Training time
 start = time.time()
 model.fit(X_train, y_train, epochs=5, batch_size=128, validation_split=0.1, callbacks=callbacks)
 end = time.time()
 
-# ✅ Results
 minutes, seconds = divmod(end - start, 60)
 print(f"\n✅ Training Time: {int(minutes)} min {int(seconds)} sec")
 
